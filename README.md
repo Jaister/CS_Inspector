@@ -9,7 +9,7 @@ CS2 Scripts for a CS2 private inspect server in Linux
 !g 60 1017 361 0.01 
 
 //OCULTIST
-!gl 4725 1417 500 0.01 
+!gl 5030 1417 500 0.01 
 
 //KARA DOPP BP 
 !g 507 417 500 0.01
@@ -21,10 +21,10 @@ CS2 Scripts for a CS2 private inspect server in Linux
 !gen 5030 10038 619 0.0001
 
 //Gungnir
-!gen 9 756 661 0.01000000000000
+!gen 9 756 661 0.01
 
 //BlueGEM
-!gen 7 44 661 0.01000000000000
+!gen 7 44 661 0.01 5 5 5 5
 
 //Kara blue gem 
 !gen 507 44 387 0.01

@@ -17,7 +17,7 @@ namespace SkinInspect;
 public class SkinInspect : BasePlugin
 {
     public override string ModuleName => "SkinInspect";
-    public override string ModuleVersion => "1.5.0";
+    public override string ModuleVersion => "1.6.0";
     public override string ModuleAuthor => "jalster";
     public override string ModuleDescription => "Apply skins via !g";
 
@@ -153,18 +153,64 @@ public class SkinInspect : BasePlugin
 
     /// <summary>
     /// Invokes <see cref="SetAttrByName"/> on a <c>CAttributeList</c> native handle to set the
-    /// paint kit and wear attributes. No-ops if the signature is unavailable.
-    /// Pattern seed is applied through CEconEntity fallback fields and replicated via
-    /// <c>SetStateChanged</c> with class <c>CEconEntity</c>.
+    /// paint kit, pattern seed, and wear attributes. No-ops if the signature is unavailable.
+    /// The seed is included in the attribute list to ensure correct pattern positioning when
+    /// additional attributes (stickers, charms) are present, which causes CS2 to read all
+    /// skin properties from the attribute list rather than fallback fields.
     /// </summary>
     /// <param name="handle">Native pointer to the <c>CAttributeList</c> instance.</param>
     /// <param name="paintindex">Paint kit definition index.</param>
+    /// <param name="patternIndex">Pattern index (seed) that determines the skin pattern variation.</param>
     /// <param name="paintwear">Wear float (0.0 = factory new, 1.0 = battle-scarred).</param>
-    private static void ApplyAttributes(nint handle, int paintindex, float paintwear)
+    private static void ApplyAttributes(nint handle, int paintindex, int patternIndex, float paintwear)
     {
         if (SetAttrByName == null) return;
         SetAttrByName.Invoke(handle, "set item texture prefab", paintindex);
+        SetAttrByName.Invoke(handle, "set item texture seed", (float)patternIndex);
         SetAttrByName.Invoke(handle, "set item texture wear", paintwear);
+    }
+
+    /// <summary>
+    /// Reinterprets an integer's raw bits as a float without numeric conversion.
+    /// Required for uint32 attributes (sticker IDs, charm IDs) passed through the
+    /// <c>SetAttrByName</c> float parameter: the engine reads the raw bits as uint32.
+    /// </summary>
+    private static float ViewAsFloat(int value) => BitConverter.Int32BitsToSingle(value);
+
+    /// <summary>
+    /// Applies sticker attributes to a <c>CAttributeList</c> handle for up to 5 slots (0-4).
+    /// Uses default values: wear=0 (pristine), scale=1, rotation=0.
+    /// </summary>
+    /// <param name="handle">Native pointer to the <c>CAttributeList</c> instance.</param>
+    /// <param name="stickerIds">Array of sticker definition indexes; 0 = empty slot.</param>
+    private static void ApplyStickers(nint handle, int[]? stickerIds)
+    {
+        if (SetAttrByName == null || stickerIds == null) return;
+        for (int i = 0; i < stickerIds.Length && i < 5; i++)
+        {
+            if (stickerIds[i] == 0) continue;
+            SetAttrByName.Invoke(handle, $"sticker slot {i} id",       ViewAsFloat(stickerIds[i]));
+            SetAttrByName.Invoke(handle, $"sticker slot {i} wear",     0f);
+            SetAttrByName.Invoke(handle, $"sticker slot {i} scale",    1f);
+            SetAttrByName.Invoke(handle, $"sticker slot {i} rotation", 0f);
+        }
+    }
+
+    /// <summary>
+    /// Applies charm (keychain) attributes to a <c>CAttributeList</c> handle.
+    /// Uses default positional offsets (0, 0, 0).
+    /// </summary>
+    /// <param name="handle">Native pointer to the <c>CAttributeList</c> instance.</param>
+    /// <param name="charmId">Keychain definition index.</param>
+    /// <param name="charmSeed">Pattern seed for the keychain (default 0).</param>
+    private static void ApplyCharm(nint handle, int charmId, int charmSeed = 0)
+    {
+        if (SetAttrByName == null || charmId <= 0) return;
+        SetAttrByName.Invoke(handle, "keychain slot 0 id",       ViewAsFloat(charmId));
+        SetAttrByName.Invoke(handle, "keychain slot 0 seed",     ViewAsFloat(charmSeed));
+        SetAttrByName.Invoke(handle, "keychain slot 0 x offset", 0f);
+        SetAttrByName.Invoke(handle, "keychain slot 0 y offset", 0f);
+        SetAttrByName.Invoke(handle, "keychain slot 0 z offset", 0f);
     }
 
     /// <summary>
@@ -178,7 +224,7 @@ public class SkinInspect : BasePlugin
     /// <param name="paintwear">Wear float value.</param>
     /// <param name="isKnife">Whether this weapon is a knife requiring subclass and quality changes.</param>
     /// <param name="knifeDefindex">The target knife definition index (only used when <paramref name="isKnife"/> is <c>true</c>).</param>
-    private void ApplySkinToWeapon(CBasePlayerWeapon weapon, int paintindex, int patternIndex, float paintwear, bool isKnife = false, int knifeDefindex = 0)
+    private void ApplySkinToWeapon(CBasePlayerWeapon weapon, int paintindex, int patternIndex, float paintwear, bool isKnife = false, int knifeDefindex = 0, int[]? stickerIds = null, int? charmId = null, int? charmSeed = null)
     {
         if (isKnife && knifeDefindex > 0)
         {
@@ -194,79 +240,20 @@ public class SkinInspect : BasePlugin
         weapon.AttributeManager.Item.EntityQuality = isKnife ? 3 : 0;
 
         weapon.AttributeManager.Item.NetworkedDynamicAttributes.Attributes.RemoveAll();
-        ApplyAttributes(weapon.AttributeManager.Item.NetworkedDynamicAttributes.Handle, paintindex, paintwear);
+        ApplyAttributes(weapon.AttributeManager.Item.NetworkedDynamicAttributes.Handle, paintindex, patternIndex, paintwear);
         weapon.AttributeManager.Item.AttributeList.Attributes.RemoveAll();
-        ApplyAttributes(weapon.AttributeManager.Item.AttributeList.Handle, paintindex, paintwear);
+        ApplyAttributes(weapon.AttributeManager.Item.AttributeList.Handle, paintindex, patternIndex, paintwear);
 
-        /* TODO: Sticker and Charm (Keychain) Support
-         *
-         * ========================== STICKERS (up to 5 slots, indexes 0-4) ==========================
-         *
-         * Stickers are applied via the same CAttributeList/SetAttrByName mechanism used above for paint.
-         * Each sticker slot requires four attributes on BOTH CAttributeList handles
-         * (NetworkedDynamicAttributes.Handle AND AttributeList.Handle):
-         *
-         *   SetAttrByName.Invoke(handle, "sticker slot X id",       (float)stickerDefindex);
-         *   SetAttrByName.Invoke(handle, "sticker slot X wear",     stickerWear);     // 0.0 = pristine, 1.0 = fully scraped
-         *   SetAttrByName.Invoke(handle, "sticker slot X scale",    stickerScale);    // typically 1.0
-         *   SetAttrByName.Invoke(handle, "sticker slot X rotation", stickerRotation); // degrees, 0.0 = default
-         *
-         * where X is the slot index (0 through 4).
-         *
-         * Implementation approach:
-         *   1. Add optional parameters to this method:
-         *        int[]? stickerIds = null, float[]? stickerWears = null
-         *   2. After the ApplyAttributes() calls above (paint attributes), loop over non-null sticker slots:
-         *        for (int i = 0; i < stickerIds.Length && i < 5; i++)
-         *        {
-         *            if (stickerIds[i] == 0) continue;
-         *            SetAttrByName.Invoke(handle, $"sticker slot {i} id",       (float)stickerIds[i]);
-         *            SetAttrByName.Invoke(handle, $"sticker slot {i} wear",     stickerWears?[i] ?? 0f);
-         *            SetAttrByName.Invoke(handle, $"sticker slot {i} scale",    1f);
-         *            SetAttrByName.Invoke(handle, $"sticker slot {i} rotation", 0f);
-         *        }
-         *   3. Apply to BOTH handles: NetworkedDynamicAttributes.Handle AND AttributeList.Handle,
-         *      following the same dual-application pattern as paint attributes above.
-         *   4. Extend command parsing in CommandG/CommandGen to accept optional sticker arguments:
-         *        !g <defindex> <paint> <seed> <wear> [stickerId0 stickerId1 ... stickerId4]
-         *
-         * ========================== CHARMS / KEYCHAINS ==========================
-         *
-         * Keychains use the same CAttributeList attribute mechanism. Key attributes:
-         *
-         *   SetAttrByName.Invoke(handle, "keychain slot 0 id",       (float)keychainDefindex);
-         *   SetAttrByName.Invoke(handle, "keychain slot 0 seed",     (float)keychainSeed);
-         *   SetAttrByName.Invoke(handle, "keychain slot 0 x offset", xOffset); // positional offset, default 0f
-         *   SetAttrByName.Invoke(handle, "keychain slot 0 y offset", yOffset);
-         *   SetAttrByName.Invoke(handle, "keychain slot 0 z offset", zOffset);
-         *
-         * Keychain defindexes are defined in items_game.txt under the keychain definitions section.
-         *
-         * Implementation approach:
-         *   1. Add optional parameters: int? charmId = null, int? charmSeed = null
-         *   2. After sticker attributes, invoke:
-         *        if (charmId.HasValue && charmId.Value > 0)
-         *        {
-         *            SetAttrByName.Invoke(handle, "keychain slot 0 id",   (float)charmId.Value);
-         *            SetAttrByName.Invoke(handle, "keychain slot 0 seed", (float)(charmSeed ?? 0));
-         *            // Offsets default to 0f unless made configurable
-         *        }
-         *   3. Apply to BOTH attribute list handles (same dual-application pattern).
-         *   4. New command syntax:
-         *        !g <defindex> <paint> <seed> <wear> --charm <charmId> [charmSeed]
-         *      Or a dedicated command: !charm <charmId> [charmSeed]
-         *
-         * ========================== CRITICAL NOTES ==========================
-         *
-         * - Both stickers and charms MUST be applied AFTER the RemoveAll() + paint attributes
-         *   but BEFORE the SetStateChanged() calls below, so they are included in the single
-         *   network state broadcast to the client.
-         * - Guard all SetAttrByName calls with the same null check (if SetAttrByName == null return).
-         * - Consider creating helper methods (ApplyStickers, ApplyCharm) following the same pattern
-         *   as ApplyAttributes() for consistency and testability.
-         * - Keychain attribute names may vary between CS2 updates; always verify against the current
-         *   items_game.txt or the CSSharp community documentation before release.
-         */
+        // Apply stickers to both attribute list handles (after paint, before SetStateChanged)
+        ApplyStickers(weapon.AttributeManager.Item.NetworkedDynamicAttributes.Handle, stickerIds);
+        ApplyStickers(weapon.AttributeManager.Item.AttributeList.Handle, stickerIds);
+
+        // Apply charm to both attribute list handles
+        if (charmId.HasValue && charmId.Value > 0)
+        {
+            ApplyCharm(weapon.AttributeManager.Item.NetworkedDynamicAttributes.Handle, charmId.Value, charmSeed ?? 0);
+            ApplyCharm(weapon.AttributeManager.Item.AttributeList.Handle, charmId.Value, charmSeed ?? 0);
+        }
 
         // Sync fallback skin properties to the client (CSS does NOT auto-mark these as dirty)
         Utilities.SetStateChanged(weapon, "CEconEntity", "m_nFallbackPaintKit");
@@ -318,10 +305,10 @@ public class SkinInspect : BasePlugin
             UpdateEconItemId(item2);
 
             item2.NetworkedDynamicAttributes.Attributes.RemoveAll();
-            ApplyAttributes(item2.NetworkedDynamicAttributes.Handle, paintindex, paintwear);
+            ApplyAttributes(item2.NetworkedDynamicAttributes.Handle, paintindex, patternIndex, paintwear);
 
             item2.AttributeList.Attributes.RemoveAll();
-            ApplyAttributes(item2.AttributeList.Handle, paintindex, paintwear);
+            ApplyAttributes(item2.AttributeList.Handle, paintindex, patternIndex, paintwear);
 
             /* TODO: If charms/keychains become applicable to gloves in a future CS2 update,
              * apply charm attributes here using the same SetAttrByName pattern
@@ -372,6 +359,45 @@ public class SkinInspect : BasePlugin
     }
 
     /// <summary>
+    /// Parses optional sticker and charm arguments from a command.
+    /// Sticker IDs are positional (up to 5, use 0 for empty slots).
+    /// Charm is specified with <c>--charm &lt;id&gt; [seed]</c>.
+    /// </summary>
+    /// <param name="info">Command arguments.</param>
+    /// <param name="startArgIndex">Index of the first optional argument (after the 4 required ones).</param>
+    /// <param name="stickerIds">Parsed sticker IDs array, or null if none provided.</param>
+    /// <param name="charmId">Parsed charm definition index, or null.</param>
+    /// <param name="charmSeed">Parsed charm seed, or null.</param>
+    private static void ParseStickerAndCharmArgs(CommandInfo info, int startArgIndex, out int[]? stickerIds, out int? charmId, out int? charmSeed)
+    {
+        stickerIds = null;
+        charmId = null;
+        charmSeed = null;
+
+        var stickers = new List<int>();
+        for (int i = startArgIndex; i < info.ArgCount; i++)
+        {
+            string arg = info.GetArg(i);
+            if (arg == "--charm")
+            {
+                if (i + 1 < info.ArgCount && int.TryParse(info.GetArg(i + 1), out int cId))
+                {
+                    charmId = cId;
+                    if (i + 2 < info.ArgCount && int.TryParse(info.GetArg(i + 2), out int cSeed))
+                        charmSeed = cSeed;
+                }
+                break;
+            }
+
+            if (stickers.Count < 5 && int.TryParse(arg, out int stickerId))
+                stickers.Add(stickerId);
+        }
+
+        if (stickers.Count > 0)
+            stickerIds = stickers.ToArray();
+    }
+
+    /// <summary>
     /// Orchestrates the full weapon or knife application flow: removes any existing instance of
     /// the target weapon (or all knives for knife swaps), gives a new item to the player, then
     /// applies skin attributes on the next server frame. For knives, a second <c>Server.NextFrame</c>
@@ -383,7 +409,7 @@ public class SkinInspect : BasePlugin
     /// <param name="paintindex">Paint kit definition index.</param>
     /// <param name="patternIndex">Pattern index (seed) that determines the skin pattern variation.</param>
     /// <param name="paintwear">Wear float value.</param>
-    private void ApplyWeaponOrKnife(CCSPlayerController player, int defindex, string weaponName, int paintindex, int patternIndex, float paintwear)
+    private void ApplyWeaponOrKnife(CCSPlayerController player, int defindex, string weaponName, int paintindex, int patternIndex, float paintwear, int[]? stickerIds = null, int? charmId = null, int? charmSeed = null)
     {
         var pawn = player.PlayerPawn.Value;
         if (pawn == null) return;
@@ -449,7 +475,7 @@ public class SkinInspect : BasePlugin
                     firstKnife ??= weapon;
                     if (weapon.AttributeManager.Item.ItemDefinitionIndex == (ushort)defindex)
                     {
-                        ApplySkinToWeapon(weapon, paintindex, patternIndex, paintwear, true, defindex);
+                        ApplySkinToWeapon(weapon, paintindex, patternIndex, paintwear, true, defindex, stickerIds, charmId, charmSeed);
                         appliedKnife = true;
                         break;
                     }
@@ -457,13 +483,13 @@ public class SkinInspect : BasePlugin
                 else
                 {
                     if (weapon.AttributeManager.Item.ItemDefinitionIndex != (ushort)defindex) continue;
-                    ApplySkinToWeapon(weapon, paintindex, patternIndex, paintwear);
+                    ApplySkinToWeapon(weapon, paintindex, patternIndex, paintwear, stickerIds: stickerIds, charmId: charmId, charmSeed: charmSeed);
                 }
             }
 
             // Fallback: if the exact defindex wasn't found, apply to the first available knife entity
             if (isKnife && !appliedKnife && firstKnife != null)
-                ApplySkinToWeapon(firstKnife, paintindex, patternIndex, paintwear, true, defindex);
+                ApplySkinToWeapon(firstKnife, paintindex, patternIndex, paintwear, true, defindex, stickerIds, charmId, charmSeed);
 
             if (isKnife)
             {
@@ -478,14 +504,19 @@ public class SkinInspect : BasePlugin
                         var weapon3 = wh3.Value;
                         if (weapon3 == null || !weapon3.IsValid) continue;
                         if (!IsKnifeEntity(weapon3) && !KnifeDefindexes.Contains(weapon3.AttributeManager.Item.ItemDefinitionIndex)) continue;
-                        ApplySkinToWeapon(weapon3, paintindex, patternIndex, paintwear, true, defindex);
+                        ApplySkinToWeapon(weapon3, paintindex, patternIndex, paintwear, true, defindex, stickerIds, charmId, charmSeed);
                         player.ExecuteClientCommand("slot3");
                         break;
                     }
                 });
             }
 
-            player.PrintToChat($" \x01[Skins] \x04{weaponName} paint={paintindex} pattern={patternIndex} wear={paintwear:F4}");
+            var msg = $" \x01[Skins] \x04{weaponName} paint={paintindex} pattern={patternIndex} wear={paintwear:F4}";
+            if (stickerIds != null)
+                msg += $" stickers=[{string.Join(",", stickerIds)}]";
+            if (charmId.HasValue)
+                msg += $" charm={charmId.Value}" + (charmSeed.HasValue ? $" seed={charmSeed.Value}" : "");
+            player.PrintToChat(msg);
         });
     }
 
@@ -502,7 +533,7 @@ public class SkinInspect : BasePlugin
 
         if (info.ArgCount < 5)
         {
-            player.PrintToChat(" \x01[Skins] \x07Uso: !g <defindex> <paintindex> <patternIndex> <wear>");
+            player.PrintToChat(" \x01[Skins] \x07Uso: !g <defindex> <paint> <seed> <wear> [sticker0..4] [--charm <id> [seed]]");
             return;
         }
 
@@ -522,7 +553,8 @@ public class SkinInspect : BasePlugin
             return;
         }
 
-        ApplyWeaponOrKnife(player, defindex, weaponName, paintindex, patternIndex, paintwear);
+        ParseStickerAndCharmArgs(info, 5, out int[]? stickerIds, out int? charmId, out int? charmSeed);
+        ApplyWeaponOrKnife(player, defindex, weaponName, paintindex, patternIndex, paintwear, stickerIds, charmId, charmSeed);
     }
 
     /// <summary>
@@ -537,7 +569,7 @@ public class SkinInspect : BasePlugin
 
         if (info.ArgCount < 5)
         {
-            player.PrintToChat(" \x01[Skins] \x07Uso: !gen <defindex> <paintindex> <patternIndex> <wear>");
+            player.PrintToChat(" \x01[Skins] \x07Uso: !gen <defindex> <paint> <seed> <wear> [sticker0..4] [--charm <id> [seed]]");
             return;
         }
 
@@ -569,7 +601,8 @@ public class SkinInspect : BasePlugin
             return;
         }
 
-        ApplyWeaponOrKnife(player, defindex, weaponName, paintindex, patternIndex, paintwear);
+        ParseStickerAndCharmArgs(info, 5, out int[]? stickerIds, out int? charmId, out int? charmSeed);
+        ApplyWeaponOrKnife(player, defindex, weaponName, paintindex, patternIndex, paintwear, stickerIds, charmId, charmSeed);
     }
 
     /// <summary>
