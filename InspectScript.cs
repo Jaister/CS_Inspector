@@ -5,6 +5,8 @@ using CounterStrikeSharp.API.Modules.Memory;
 using CounterStrikeSharp.API.Modules.Memory.DynamicFunctions;
 using Microsoft.Extensions.Logging;
 using System.Reflection;
+using System.Text.Json;
+using System.Text.Json.Serialization;
 
 namespace SkinInspect;
 
@@ -23,6 +25,12 @@ public class SkinInspect : BasePlugin
 
     /// <summary>Monotonically increasing counter used to generate unique <see cref="CEconItemView"/> item IDs.</summary>
     private static ulong NextItemId = 65578;
+
+    /// <summary>
+    /// Runtime mapping of weapon defindex to paint kit IDs that require legacy mesh bodygroup.
+    /// Populated from <c>legacy_paints.json</c> on plugin load.
+    /// </summary>
+    private readonly Dictionary<int, HashSet<int>> LegacyPaintsByWeapon = new();
 
     /// <summary>
     /// Cached memory function pointer to <c>CAttributeList_SetOrAddAttributeValueByName</c>.
@@ -93,12 +101,22 @@ public class SkinInspect : BasePlugin
     };
 
     /// <summary>
+    /// DTO used to deserialize legacy mesh configuration from JSON.
+    /// </summary>
+    private sealed class LegacyPaintConfig
+    {
+        [JsonPropertyName("legacy_by_weapon")]
+        public Dictionary<string, List<int>>? LegacyByWeapon { get; set; }
+    }
+
+    /// <summary>
     /// Plugin entry point. Registers chat commands and validates that the attribute
     /// memory signature is available for glove rendering.
     /// </summary>
     /// <param name="hotReload">Whether the plugin was hot-reloaded mid-session.</param>
     public override void Load(bool hotReload)
     {
+        LoadLegacyPaintConfig();
         AddCommand("css_gen", "Apply skin or gloves", CommandGen);
         AddCommand("css_g", "Apply skin", CommandG);
         AddCommand("css_gl", "Apply gloves", CommandGl);
@@ -107,6 +125,143 @@ public class SkinInspect : BasePlugin
             Logger.LogWarning("Signature CAttributeList_SetOrAddAttributeValueByName no encontrada. Los guantes pueden no renderizarse.");
         }
         Logger.LogInformation("SkinInspect loaded");
+    }
+
+    /// <summary>
+    /// Tries to locate the server's <c>game</c> directory from a starting path.
+    /// </summary>
+    private static string? TryFindGameDirectory(string? startPath)
+    {
+        if (string.IsNullOrWhiteSpace(startPath))
+            return null;
+
+        string absoluteStart;
+        try
+        {
+            absoluteStart = Path.GetFullPath(startPath);
+        }
+        catch
+        {
+            return null;
+        }
+
+        var current = new DirectoryInfo(absoluteStart);
+        if (!current.Exists && current.Parent != null)
+            current = current.Parent;
+
+        while (current != null)
+        {
+            if (string.Equals(current.Name, "game", StringComparison.OrdinalIgnoreCase))
+                return current.FullName;
+
+            var gameChild = Path.Combine(current.FullName, "game");
+            if (Directory.Exists(gameChild))
+                return gameChild;
+
+            current = current.Parent;
+        }
+
+        return null;
+    }
+
+    /// <summary>
+    /// Returns legacy config path anchored to the detected <c>game</c> directory.
+    /// </summary>
+    private static string GetLegacyConfigPath()
+    {
+        var assemblyDir = Path.GetDirectoryName(typeof(SkinInspect).Assembly.Location);
+        var gameDir = TryFindGameDirectory(assemblyDir)
+                      ?? TryFindGameDirectory(AppContext.BaseDirectory)
+                      ?? TryFindGameDirectory(Environment.CurrentDirectory);
+
+        if (!string.IsNullOrWhiteSpace(gameDir))
+        {
+            return Path.Combine(gameDir, "csgo", "addons", "counterstrikesharp", "plugins", "SkinInspect", "legacy_paints.json");
+        }
+
+        return Path.GetFullPath(Path.Combine("game", "csgo", "addons", "counterstrikesharp", "plugins", "SkinInspect", "legacy_paints.json"));
+    }
+
+    /// <summary>
+    /// Loads the optional legacy mesh map from <c>legacy_paints.json</c>.
+    /// Unknown or invalid entries are skipped; missing file defaults to modern meshes.
+    /// </summary>
+    private void LoadLegacyPaintConfig()
+    {
+        LegacyPaintsByWeapon.Clear();
+
+        var configPath = GetLegacyConfigPath();
+        if (!File.Exists(configPath))
+        {
+            Logger.LogInformation("Legacy mesh config not found at {Path}. Defaulting to modern meshes.", configPath);
+            return;
+        }
+
+        try
+        {
+            var config = JsonSerializer.Deserialize<LegacyPaintConfig>(File.ReadAllText(configPath));
+            if (config?.LegacyByWeapon == null || config.LegacyByWeapon.Count == 0)
+            {
+                Logger.LogWarning("Legacy mesh config {Path} is empty or invalid. Defaulting to modern meshes.", configPath);
+                return;
+            }
+
+            int totalPairs = 0;
+            foreach (var entry in config.LegacyByWeapon)
+            {
+                if (!int.TryParse(entry.Key, out int defindex))
+                {
+                    Logger.LogWarning("Skipping legacy mesh entry with invalid defindex key '{Key}'.", entry.Key);
+                    continue;
+                }
+
+                if (KnifeDefindexes.Contains(defindex) || GloveDefindexes.Contains(defindex) || !DefindexToWeapon.ContainsKey(defindex))
+                {
+                    continue;
+                }
+
+                if (entry.Value == null || entry.Value.Count == 0)
+                {
+                    continue;
+                }
+
+                var paintSet = new HashSet<int>();
+                foreach (var paintId in entry.Value)
+                {
+                    if (paintId > 0)
+                        paintSet.Add(paintId);
+                }
+
+                if (paintSet.Count == 0)
+                    continue;
+
+                LegacyPaintsByWeapon[defindex] = paintSet;
+                totalPairs += paintSet.Count;
+            }
+
+            Logger.LogInformation(
+                "Loaded legacy mesh config from {Path}: {WeaponCount} weapons, {PairCount} paint mappings.",
+                configPath,
+                LegacyPaintsByWeapon.Count,
+                totalPairs);
+        }
+        catch (Exception ex)
+        {
+            Logger.LogWarning(ex, "Failed to parse legacy mesh config {Path}. Defaulting to modern meshes.", configPath);
+            LegacyPaintsByWeapon.Clear();
+        }
+    }
+
+    /// <summary>
+    /// Determines whether the requested weapon skin should use legacy mesh bodygroup.
+    /// </summary>
+    private bool ShouldUseLegacyMesh(int defindex, int paintindex, bool isKnife)
+    {
+        if (isKnife || paintindex <= 0)
+            return false;
+
+        return LegacyPaintsByWeapon.TryGetValue(defindex, out var legacyPaints)
+            && legacyPaints.Contains(paintindex);
     }
 
     /// <summary>
@@ -152,22 +307,34 @@ public class SkinInspect : BasePlugin
     }
 
     /// <summary>
-    /// Invokes <see cref="SetAttrByName"/> on a <c>CAttributeList</c> native handle to set the
-    /// paint kit, pattern seed, and wear attributes. No-ops if the signature is unavailable.
-    /// The seed is included in the attribute list to ensure correct pattern positioning when
-    /// additional attributes (stickers, charms) are present, which causes CS2 to read all
-    /// skin properties from the attribute list rather than fallback fields.
+    /// Writes only <c>"set item texture prefab"</c> for a weapon. Mirrors WeaponPaints'
+    /// approach: weapons rely on <c>FallbackPaintKit/FallbackSeed/FallbackWear</c> for
+    /// the seed and wear; only the paint kit goes into the attribute list, and only into
+    /// <c>NetworkedDynamicAttributes</c>. Writing seed/wear to the list breaks pattern alignment.
     /// </summary>
-    /// <param name="handle">Native pointer to the <c>CAttributeList</c> instance.</param>
+    /// <param name="handle">Native pointer to the weapon's <c>NetworkedDynamicAttributes</c> handle.</param>
     /// <param name="paintindex">Paint kit definition index.</param>
-    /// <param name="patternIndex">Pattern index (seed) that determines the skin pattern variation.</param>
-    /// <param name="paintwear">Wear float (0.0 = factory new, 1.0 = battle-scarred).</param>
-    private static void ApplyAttributes(nint handle, int paintindex, int patternIndex, float paintwear)
+    private static void ApplyWeaponPaint(nint handle, int paintindex)
     {
         if (SetAttrByName == null) return;
         SetAttrByName.Invoke(handle, "set item texture prefab", paintindex);
-        SetAttrByName.Invoke(handle, "set item texture seed", (float)patternIndex);
-        SetAttrByName.Invoke(handle, "set item texture wear", paintwear);
+    }
+
+    /// <summary>
+    /// Writes the full paint/seed/wear triplet for a glove item. Gloves don't have
+    /// <c>FallbackPaintKit/Seed/Wear</c> fields like weapons do, so all three attributes
+    /// must be written to the attribute list directly. Mirrors WeaponPaints' glove path.
+    /// </summary>
+    /// <param name="handle">Native pointer to a glove <c>CAttributeList</c> handle.</param>
+    /// <param name="paintindex">Paint kit definition index.</param>
+    /// <param name="patternIndex">Pattern seed index.</param>
+    /// <param name="paintwear">Wear float (0.0 = factory new, 1.0 = battle-scarred).</param>
+    private static void ApplyGloveAttributes(nint handle, int paintindex, int patternIndex, float paintwear)
+    {
+        if (SetAttrByName == null) return;
+        SetAttrByName.Invoke(handle, "set item texture prefab", paintindex);
+        SetAttrByName.Invoke(handle, "set item texture seed",   patternIndex);
+        SetAttrByName.Invoke(handle, "set item texture wear",   paintwear);
     }
 
     /// <summary>
@@ -207,10 +374,10 @@ public class SkinInspect : BasePlugin
     {
         if (SetAttrByName == null || charmId <= 0) return;
         SetAttrByName.Invoke(handle, "keychain slot 0 id",       ViewAsFloat(charmId));
+        SetAttrByName.Invoke(handle, "keychain slot 0 offset x", 0f);
+        SetAttrByName.Invoke(handle, "keychain slot 0 offset y", 0f);
+        SetAttrByName.Invoke(handle, "keychain slot 0 offset z", 0f);
         SetAttrByName.Invoke(handle, "keychain slot 0 seed",     ViewAsFloat(charmSeed));
-        SetAttrByName.Invoke(handle, "keychain slot 0 x offset", 0f);
-        SetAttrByName.Invoke(handle, "keychain slot 0 y offset", 0f);
-        SetAttrByName.Invoke(handle, "keychain slot 0 z offset", 0f);
     }
 
     /// <summary>
@@ -239,20 +406,28 @@ public class SkinInspect : BasePlugin
         // EntityQuality 3 = "star" quality used by knives; 0 = default for regular weapons
         weapon.AttributeManager.Item.EntityQuality = isKnife ? 3 : 0;
 
-        weapon.AttributeManager.Item.NetworkedDynamicAttributes.Attributes.RemoveAll();
-        ApplyAttributes(weapon.AttributeManager.Item.NetworkedDynamicAttributes.Handle, paintindex, patternIndex, paintwear);
+        // Clear both attribute lists, then write ONLY "set item texture prefab" to
+        // NetworkedDynamicAttributes (matches WeaponPaints' GivePlayerWeaponSkin exactly).
+        // Seed and wear stay out of the attribute list — they come from FallbackSeed/FallbackWear.
+        // Writing seed to the list was the cause of the pattern misalignment.
         weapon.AttributeManager.Item.AttributeList.Attributes.RemoveAll();
-        ApplyAttributes(weapon.AttributeManager.Item.AttributeList.Handle, paintindex, patternIndex, paintwear);
+        weapon.AttributeManager.Item.NetworkedDynamicAttributes.Attributes.RemoveAll();
 
-        // Apply stickers to both attribute list handles (after paint, before SetStateChanged)
+        ApplyWeaponPaint(weapon.AttributeManager.Item.NetworkedDynamicAttributes.Handle, paintindex);
+
         ApplyStickers(weapon.AttributeManager.Item.NetworkedDynamicAttributes.Handle, stickerIds);
-        ApplyStickers(weapon.AttributeManager.Item.AttributeList.Handle, stickerIds);
 
-        // Apply charm to both attribute list handles
         if (charmId.HasValue && charmId.Value > 0)
         {
             ApplyCharm(weapon.AttributeManager.Item.NetworkedDynamicAttributes.Handle, charmId.Value, charmSeed ?? 0);
-            ApplyCharm(weapon.AttributeManager.Item.AttributeList.Handle, charmId.Value, charmSeed ?? 0);
+        }
+
+        // Legacy-model skins are auto-resolved from legacy_paints.json.
+        // No-op for knives (their mesh is controlled by subclass/defindex instead).
+        if (!isKnife)
+        {
+            bool useLegacyMesh = ShouldUseLegacyMesh(weapon.AttributeManager.Item.ItemDefinitionIndex, paintindex, isKnife);
+            weapon.AcceptInput("SetBodygroup", value: $"body,{(useLegacyMesh ? 1 : 0)}");
         }
 
         // Sync fallback skin properties to the client (CSS does NOT auto-mark these as dirty)
@@ -305,10 +480,10 @@ public class SkinInspect : BasePlugin
             UpdateEconItemId(item2);
 
             item2.NetworkedDynamicAttributes.Attributes.RemoveAll();
-            ApplyAttributes(item2.NetworkedDynamicAttributes.Handle, paintindex, patternIndex, paintwear);
+            ApplyGloveAttributes(item2.NetworkedDynamicAttributes.Handle, paintindex, patternIndex, paintwear);
 
             item2.AttributeList.Attributes.RemoveAll();
-            ApplyAttributes(item2.AttributeList.Handle, paintindex, patternIndex, paintwear);
+            ApplyGloveAttributes(item2.AttributeList.Handle, paintindex, patternIndex, paintwear);
 
             /* TODO: If charms/keychains become applicable to gloves in a future CS2 update,
              * apply charm attributes here using the same SetAttrByName pattern
@@ -378,6 +553,7 @@ public class SkinInspect : BasePlugin
         for (int i = startArgIndex; i < info.ArgCount; i++)
         {
             string arg = info.GetArg(i);
+
             if (arg == "--charm")
             {
                 if (i + 1 < info.ArgCount && int.TryParse(info.GetArg(i + 1), out int cId))
@@ -385,8 +561,10 @@ public class SkinInspect : BasePlugin
                     charmId = cId;
                     if (i + 2 < info.ArgCount && int.TryParse(info.GetArg(i + 2), out int cSeed))
                         charmSeed = cSeed;
+                    // Skip past the consumed arguments so optional arguments after --charm still parse.
+                    i += charmSeed.HasValue ? 2 : 1;
                 }
-                break;
+                continue;
             }
 
             if (stickers.Count < 5 && int.TryParse(arg, out int stickerId))
@@ -512,10 +690,13 @@ public class SkinInspect : BasePlugin
             }
 
             var msg = $" \x01[Skins] \x04{weaponName} paint={paintindex} pattern={patternIndex} wear={paintwear:F4}";
+            bool autoLegacy = ShouldUseLegacyMesh(defindex, paintindex, isKnife);
             if (stickerIds != null)
                 msg += $" stickers=[{string.Join(",", stickerIds)}]";
             if (charmId.HasValue)
                 msg += $" charm={charmId.Value}" + (charmSeed.HasValue ? $" seed={charmSeed.Value}" : "");
+            if (autoLegacy)
+                msg += " legacy(auto)";
             player.PrintToChat(msg);
         });
     }
